@@ -1,0 +1,135 @@
+"""
+Educational Translation Engine for Nu-Voice.
+Translates English course material into natural, pedagogical Hausa or French
+using ultra-fast LLM inference (Groq / OpenAI / Gemini).
+"""
+
+import os
+import logging
+import httpx
+from typing import Optional
+
+try:
+    from config import settings
+except ImportError:
+    from ..config import settings
+
+logger = logging.getLogger(__name__)
+
+LANGUAGE_NAMES = {
+    "ha": "Hausa",
+    "fr": "French",
+    "en": "English",
+}
+
+HAUSA_SYSTEM_PROMPT = """You are an expert native Hausa linguist and educator.
+Translate the following educational course text into natural, spoken Standard Hausa suitable for an audio lecture.
+Rules:
+1. Ensure the rhythm and sentence structures sound natural when spoken aloud.
+2. Use accurate Hausa orthography with hooked consonants (ɓ, ɗ, ƙ, ƴ).
+3. Keep technical or domain terms recognizable, explaining them briefly in Hausa if necessary.
+4. Output ONLY the translated Hausa text. Do not include markdown preamble, translator notes, or quotes.
+"""
+
+FRENCH_SYSTEM_PROMPT = """You are an expert French educational instructor.
+Translate the following educational course text into natural, clear, and engaging spoken French suitable for an audio lecture.
+Rules:
+1. Ensure phrasing flows naturally for speech and listening comprehension.
+2. Maintain pedagogical clarity and professional, warm tone.
+3. Output ONLY the translated French text. Do not include introductory remarks or metadata.
+"""
+
+
+class Translator:
+    def __init__(
+        self,
+        openai_api_key: Optional[str] = None,
+        groq_api_key: Optional[str] = None,
+    ):
+        self.openai_api_key = openai_api_key or settings.OPENAI_API_KEY or os.getenv("OPENAI_API_KEY", "")
+        self.groq_api_key = groq_api_key or settings.GROQ_API_KEY or os.getenv("GROQ_API_KEY", "")
+
+    async def translate_text(
+        self,
+        text: str,
+        target_lang: str,
+        source_lang: str = "en",
+    ) -> str:
+        """
+        Translates text to target_lang.
+        If target_lang == source_lang, returns text unchanged.
+        """
+        target_lang = (target_lang or "en").lower().strip()
+        source_lang = (source_lang or "en").lower().strip()
+
+        if target_lang == source_lang or not text.strip():
+            return text
+
+        system_prompt = HAUSA_SYSTEM_PROMPT if target_lang == "ha" else FRENCH_SYSTEM_PROMPT
+        target_name = LANGUAGE_NAMES.get(target_lang, target_lang)
+
+        # 1. Try Groq first for blazing-fast inference (< 250ms)
+        if self.groq_api_key:
+            try:
+                translated = await self._call_groq(text, system_prompt)
+                if translated and len(translated.strip()) > 0:
+                    return translated.strip()
+            except Exception as e:
+                logger.warning(f"Groq translation failed: {e}. Falling back to OpenAI.")
+
+        # 2. Fallback to OpenAI
+        if self.openai_api_key:
+            try:
+                translated = await self._call_openai(text, system_prompt)
+                if translated and len(translated.strip()) > 0:
+                    return translated.strip()
+            except Exception as e:
+                logger.error(f"OpenAI translation failed: {e}")
+
+        # If both fail or not configured, return original text
+        logger.warning(f"Translation to {target_name} unavailable; using original text.")
+        return text
+
+    async def _call_groq(self, text: str, system_prompt: str) -> str:
+        headers = {
+            "Authorization": f"Bearer {self.groq_api_key}",
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "model": "llama-3.3-70b-versatile",
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": text},
+            ],
+            "temperature": 0.3,
+            "max_tokens": 2048,
+        }
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            res = await client.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=payload)
+            if res.status_code == 200:
+                data = res.json()
+                return data["choices"][0]["message"]["content"]
+            else:
+                raise RuntimeError(f"Groq error HTTP {res.status_code}: {res.text}")
+
+    async def _call_openai(self, text: str, system_prompt: str) -> str:
+        headers = {
+            "Authorization": f"Bearer {self.openai_api_key}",
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "model": "gpt-4o-mini",
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": text},
+            ],
+            "temperature": 0.3,
+            "max_tokens": 2048,
+        }
+        async with httpx.AsyncClient(timeout=25.0) as client:
+            res = await client.post("https://api.openai.com/v1/chat/completions", headers=headers, json=payload)
+            if res.status_code == 200:
+                data = res.json()
+                return data["choices"][0]["message"]["content"]
+            else:
+                raise RuntimeError(f"OpenAI error HTTP {res.status_code}: {res.text}")
