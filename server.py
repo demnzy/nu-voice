@@ -1,7 +1,8 @@
-"""
+﻿"""
 Nu-Voice FastAPI Microservice.
 High-throughput, low-latency streaming TTS engine supporting English, French, and Hausa.
-Features sentence-by-sentence streaming, client disconnect cancellation, and Bunny CDN caching.
+Features decoupled background synthesis, Bunny CDN persistent caching, client disconnect resiliency,
+and task deduplication.
 """
 
 import asyncio
@@ -10,7 +11,7 @@ import logging
 import os
 import sys
 from pathlib import Path
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 from pydantic import BaseModel, Field
 
 # Ensure repo root is on sys.path
@@ -50,6 +51,7 @@ translator = Translator()
 bunny_storage = BunnyAudioStorage()
 
 AUDIO_CACHE: Dict[str, str] = {}
+_ACTIVE_SYNTHESES: Dict[str, asyncio.Task] = {}
 
 
 class LessonStreamRequest(BaseModel):
@@ -63,6 +65,17 @@ class LessonStreamRequest(BaseModel):
 
 def compute_content_hash(text: str) -> str:
     return hashlib.sha256(text.strip().encode("utf-8")).hexdigest()[:16]
+
+
+@app.get("/")
+async def root():
+    return {
+        "service": "nu-voice",
+        "status": "healthy",
+        "version": "1.0.0",
+        "cache_entries": len(AUDIO_CACHE),
+        "active_syntheses": len(_ACTIVE_SYNTHESES),
+    }
 
 
 @app.get("/v1/tts/stream")
@@ -110,12 +123,71 @@ async def stream_generic_text(
     )
 
 
-@app.post("/v1/tts/lesson/stream")
-async def stream_lesson_audio(
-    payload: LessonStreamRequest,
-    request: Request,
-    background_tasks: BackgroundTasks,
+async def _synthesize_lesson_to_cdn(
+    cache_key: str,
+    lesson_id: str,
+    target_lang: str,
+    content_hash: str,
+    sentences: List[str],
+    audio_format: str,
+    chunk_queue: Optional[asyncio.Queue] = None,
 ):
+    """
+    Decoupled background worker that synthesizes ALL sentences to completion
+    and uploads the full audio to Bunny CDN.
+    If chunk_queue is provided, pushes chunks as they complete for real-time streaming.
+    Even if client disconnects, this task continues to completion so future requests get instant cache hits!
+    """
+    accumulated_audio = bytearray()
+    logger.info(f"Decoupled synthesis worker started for lesson {lesson_id} [{target_lang}]: {len(sentences)} sentences")
+    try:
+        for idx, sentence in enumerate(sentences):
+            try:
+                chunk = await asyncio.to_thread(
+                    engine_manager.synthesize_sentence_audio_bytes,
+                    sentence,
+                    lang=target_lang,
+                    format=audio_format,
+                )
+                accumulated_audio.extend(chunk)
+                if chunk_queue:
+                    await chunk_queue.put(chunk)
+            except Exception as e:
+                logger.error(f"Failed chunk {idx+1}/{len(sentences)} for lesson {lesson_id}: {e}")
+
+        if chunk_queue:
+            await chunk_queue.put(None)  # Sentinel for completion
+
+        if len(accumulated_audio) > 0:
+            logger.info(f"Synthesized full audio for lesson {lesson_id} [{target_lang}] ({len(accumulated_audio)} bytes). Uploading to Bunny CDN.")
+            filename = f"{lesson_id}_{target_lang}_{content_hash}.mp3"
+            cdn_url = await bunny_storage.upload_audio_bytes(
+                audio_bytes=bytes(accumulated_audio),
+                filename=filename,
+                folder_path="lessons/audio",
+            )
+            AUDIO_CACHE[cache_key] = cdn_url
+            logger.info(f"Successfully cached lesson {lesson_id} [{target_lang}] to Bunny CDN -> {cdn_url}")
+            return cdn_url
+    except Exception as e:
+        logger.error(f"Background synthesis error for lesson {lesson_id} [{target_lang}]: {e}")
+        if chunk_queue:
+            await chunk_queue.put(None)
+    finally:
+        _ACTIVE_SYNTHESES.pop(cache_key, None)
+
+
+@app.post("/v1/tts/lesson/prepare")
+@app.get("/v1/tts/lesson/prepare")
+async def prepare_lesson_audio(
+    payload: LessonStreamRequest,
+):
+    """
+    Explicit background preparation endpoint.
+    If already cached: returns CDN URL immediately.
+    If in progress: returns status='generating'.
+    If new: launches decoupled background synthesis and CDN upload.
+    """
     lesson_id = payload.lesson_id.strip()
     target_lang = payload.target_lang.lower().strip()
     source_lang = payload.source_lang.lower().strip()
@@ -128,6 +200,75 @@ async def stream_lesson_audio(
     cache_key = f"{lesson_id}_{target_lang}_{content_hash}"
 
     if cache_key in AUDIO_CACHE:
+        return {
+            "status": "ready",
+            "cached": True,
+            "audio_url": AUDIO_CACHE[cache_key],
+            "lesson_id": lesson_id,
+            "language": target_lang,
+        }
+
+    if cache_key in _ACTIVE_SYNTHESES:
+        return {
+            "status": "generating",
+            "cached": False,
+            "lesson_id": lesson_id,
+            "language": target_lang,
+            "message": "Synthesis in progress",
+        }
+
+    # Translate if necessary
+    if target_lang != source_lang:
+        try:
+            text = await translator.translate_text(text, target_lang=target_lang, source_lang=source_lang)
+        except Exception as e:
+            logger.error(f"Translation failed: {e}. Proceeding with original text.")
+
+    sentences = prepare_text_for_speech(text, lang=target_lang)
+    if not sentences:
+        raise HTTPException(status_code=400, detail="No readable sentences in lesson.")
+
+    # Launch decoupled background synthesis
+    task = asyncio.create_task(
+        _synthesize_lesson_to_cdn(
+            cache_key=cache_key,
+            lesson_id=lesson_id,
+            target_lang=target_lang,
+            content_hash=content_hash,
+            sentences=sentences,
+            audio_format=payload.format,
+            chunk_queue=None,
+        )
+    )
+    _ACTIVE_SYNTHESES[cache_key] = task
+
+    return {
+        "status": "generating",
+        "cached": False,
+        "lesson_id": lesson_id,
+        "language": target_lang,
+        "message": "Synthesis started in background",
+    }
+
+
+@app.post("/v1/tts/lesson/stream")
+async def stream_lesson_audio(
+    payload: LessonStreamRequest,
+    request: Request,
+):
+    lesson_id = payload.lesson_id.strip()
+    target_lang = payload.target_lang.lower().strip()
+    source_lang = payload.source_lang.lower().strip()
+    text = payload.content_text.strip()
+
+    if not text:
+        raise HTTPException(status_code=400, detail="Lesson text cannot be empty.")
+
+    content_hash = compute_content_hash(text)
+    cache_key = f"{lesson_id}_{target_lang}_{content_hash}"
+
+    # 1. Instant Cache Hit
+    if cache_key in AUDIO_CACHE:
         cdn_url = AUDIO_CACHE[cache_key]
         logger.info(f"Cache HIT for lesson {lesson_id} [{target_lang}]: {cdn_url}")
         return JSONResponse(
@@ -139,6 +280,7 @@ async def stream_lesson_audio(
             }
         )
 
+    # 2. Translate if needed
     if target_lang != source_lang:
         logger.info(f"Translating lesson {lesson_id} from {source_lang} to {target_lang}...")
         try:
@@ -150,40 +292,44 @@ async def stream_lesson_audio(
     if not sentences:
         raise HTTPException(status_code=400, detail="No readable sentences in lesson.")
 
-    accumulated_audio = bytearray()
+    # 3. Queue-based streaming decoupled from client drops
+    chunk_queue: asyncio.Queue = asyncio.Queue()
+
+    # Launch decoupled task if not already running
+    if cache_key not in _ACTIVE_SYNTHESES:
+        task = asyncio.create_task(
+            _synthesize_lesson_to_cdn(
+                cache_key=cache_key,
+                lesson_id=lesson_id,
+                target_lang=target_lang,
+                content_hash=content_hash,
+                sentences=sentences,
+                audio_format=payload.format,
+                chunk_queue=chunk_queue,
+            )
+        )
+        _ACTIVE_SYNTHESES[cache_key] = task
 
     async def lesson_audio_generator():
-        logger.info(f"Streaming lesson {lesson_id} [{target_lang}]: {len(sentences)} sentences")
-        all_completed = True
+        logger.info(f"Streaming lesson {lesson_id} [{target_lang}] to client...")
+        try:
+            while True:
+                if await request.is_disconnected():
+                    logger.info(f"Client disconnected during stream of lesson {lesson_id}. Decoupled background synthesis continues.")
+                    break
 
-        for idx, sentence in enumerate(sentences):
-            if await request.is_disconnected():
-                logger.info(f"Student disconnected at sentence {idx+1}/{len(sentences)} of lesson {lesson_id}. Aborting.")
-                all_completed = False
-                return
+                try:
+                    chunk = await asyncio.wait_for(chunk_queue.get(), timeout=15.0)
+                except asyncio.TimeoutError:
+                    if cache_key not in _ACTIVE_SYNTHESES:
+                        break
+                    continue
 
-            try:
-                chunk = await asyncio.to_thread(
-                    engine_manager.synthesize_sentence_audio_bytes,
-                    sentence,
-                    lang=target_lang,
-                    format=payload.format,
-                )
-                accumulated_audio.extend(chunk)
+                if chunk is None:  # Sentinel
+                    break
                 yield chunk
-            except Exception as e:
-                logger.error(f"Failed chunk {idx+1} for lesson {lesson_id}: {e}")
-                continue
-
-        if all_completed and len(accumulated_audio) > 0:
-            logger.info(f"Synthesized full audio for lesson {lesson_id} ({len(accumulated_audio)} bytes). Queueing CDN upload.")
-            filename = f"{lesson_id}_{target_lang}_{content_hash}.mp3"
-            background_tasks.add_task(
-                _upload_and_record_cache,
-                cache_key=cache_key,
-                filename=filename,
-                audio_bytes=bytes(accumulated_audio),
-            )
+        except Exception as e:
+            logger.warning(f"Stream generator notice for lesson {lesson_id}: {e}")
 
     media_type = "audio/mpeg" if payload.format.lower() == "mp3" else "audio/wav"
     return StreamingResponse(
@@ -199,19 +345,6 @@ async def stream_lesson_audio(
     )
 
 
-async def _upload_and_record_cache(cache_key: str, filename: str, audio_bytes: bytes):
-    try:
-        cdn_url = await bunny_storage.upload_audio_bytes(
-            audio_bytes=audio_bytes,
-            filename=filename,
-            folder_path="lessons/audio",
-        )
-        AUDIO_CACHE[cache_key] = cdn_url
-        logger.info(f"Registered audio cache key '{cache_key}' -> {cdn_url}")
-    except Exception as e:
-        logger.error(f"Failed to cache lesson audio to Bunny CDN: {e}")
-
-
 @app.get("/v1/tts/health")
 async def health_check():
     return {
@@ -220,7 +353,9 @@ async def health_check():
         "port": settings.PORT,
         "loaded_engines": list(engine_manager.engines.keys()),
         "cache_entries": len(AUDIO_CACHE),
+        "active_syntheses": len(_ACTIVE_SYNTHESES),
     }
+
 
 if __name__ == "__main__":
     import uvicorn

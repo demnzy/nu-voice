@@ -1,4 +1,4 @@
---extra-index-url https://download.pytorch.org/whl/cpu
+﻿--extra-index-url https://download.pytorch.org/whl/cpu
 
 fastapi>=0.110.0
 uvicorn[standard]>=0.28.0
@@ -14,3 +14,5 @@ num2words>=0.5.13
 psutil>=5.9.0
 lameenc>=1.7.0
 kokoro>=0.8.4
+spacy>=3.7.0
+https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl

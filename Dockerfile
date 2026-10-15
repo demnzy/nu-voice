@@ -1,4 +1,4 @@
-FROM python:3.11-slim
+﻿FROM python:3.11-slim
 
 WORKDIR /app
 
@@ -18,4 +18,4 @@ COPY . /app
 ENV PYTHONPATH=/app
 EXPOSE 8000
 
-CMD ["uvicorn", "server:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "2"]
+CMD ["uvicorn", "server:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]

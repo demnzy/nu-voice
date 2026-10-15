@@ -1,7 +1,7 @@
-"""
+﻿"""
 Educational Translation Engine for Nu-Voice.
 Translates English course material into natural, pedagogical Hausa or French
-using ultra-fast LLM inference (Groq / OpenAI / Gemini).
+using ultra-fast LLM inference (OpenAI by default, with Groq fallback).
 """
 
 import os
@@ -45,9 +45,11 @@ class Translator:
         self,
         openai_api_key: Optional[str] = None,
         groq_api_key: Optional[str] = None,
+        default_provider: Optional[str] = None,
     ):
-        self.openai_api_key = openai_api_key or settings.OPENAI_API_KEY or os.getenv("OPENAI_API_KEY", "")
-        self.groq_api_key = groq_api_key or settings.GROQ_API_KEY or os.getenv("GROQ_API_KEY", "")
+        self.openai_api_key = openai_api_key or getattr(settings, "OPENAI_API_KEY", "") or os.getenv("OPENAI_API_KEY", "")
+        self.groq_api_key = groq_api_key or getattr(settings, "GROQ_API_KEY", "") or os.getenv("GROQ_API_KEY", "")
+        self.default_provider = (default_provider or getattr(settings, "DEFAULT_TRANSLATION_PROVIDER", "openai") or "openai").lower().strip()
 
     async def translate_text(
         self,
@@ -58,6 +60,7 @@ class Translator:
         """
         Translates text to target_lang.
         If target_lang == source_lang, returns text unchanged.
+        Defaults to OpenAI (gpt-4o-mini) as the primary provider.
         """
         target_lang = (target_lang or "en").lower().strip()
         source_lang = (source_lang or "en").lower().strip()
@@ -68,49 +71,36 @@ class Translator:
         system_prompt = HAUSA_SYSTEM_PROMPT if target_lang == "ha" else FRENCH_SYSTEM_PROMPT
         target_name = LANGUAGE_NAMES.get(target_lang, target_lang)
 
-        # 1. Try Groq first for blazing-fast inference (< 250ms)
+        # 1. Primary Provider: OpenAI (Default)
+        if self.default_provider == "openai" and self.openai_api_key:
+            try:
+                translated = await self._call_openai(text, system_prompt)
+                if translated and len(translated.strip()) > 0:
+                    return translated.strip()
+            except Exception as e:
+                logger.warning(f"OpenAI translation failed: {e}. Attempting Groq fallback.")
+
+        # 2. Secondary Provider / Groq Fallback
         if self.groq_api_key:
             try:
                 translated = await self._call_groq(text, system_prompt)
                 if translated and len(translated.strip()) > 0:
                     return translated.strip()
             except Exception as e:
-                logger.warning(f"Groq translation failed: {e}. Falling back to OpenAI.")
+                logger.warning(f"Groq translation failed: {e}.")
 
-        # 2. Fallback to OpenAI
-        if self.openai_api_key:
+        # 3. Tertiary fallback to OpenAI if Groq was primary but failed
+        if self.default_provider != "openai" and self.openai_api_key:
             try:
                 translated = await self._call_openai(text, system_prompt)
                 if translated and len(translated.strip()) > 0:
                     return translated.strip()
             except Exception as e:
-                logger.error(f"OpenAI translation failed: {e}")
+                logger.error(f"OpenAI fallback translation failed: {e}")
 
-        # If both fail or not configured, return original text
+        # If all providers fail or are not configured, return original text
         logger.warning(f"Translation to {target_name} unavailable; using original text.")
         return text
-
-    async def _call_groq(self, text: str, system_prompt: str) -> str:
-        headers = {
-            "Authorization": f"Bearer {self.groq_api_key}",
-            "Content-Type": "application/json",
-        }
-        payload = {
-            "model": "llama-3.3-70b-versatile",
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": text},
-            ],
-            "temperature": 0.3,
-            "max_tokens": 2048,
-        }
-        async with httpx.AsyncClient(timeout=20.0) as client:
-            res = await client.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=payload)
-            if res.status_code == 200:
-                data = res.json()
-                return data["choices"][0]["message"]["content"]
-            else:
-                raise RuntimeError(f"Groq error HTTP {res.status_code}: {res.text}")
 
     async def _call_openai(self, text: str, system_prompt: str) -> str:
         headers = {
@@ -126,10 +116,33 @@ class Translator:
             "temperature": 0.3,
             "max_tokens": 2048,
         }
-        async with httpx.AsyncClient(timeout=25.0) as client:
+        async with httpx.AsyncClient(timeout=30.0) as client:
             res = await client.post("https://api.openai.com/v1/chat/completions", headers=headers, json=payload)
             if res.status_code == 200:
                 data = res.json()
                 return data["choices"][0]["message"]["content"]
             else:
                 raise RuntimeError(f"OpenAI error HTTP {res.status_code}: {res.text}")
+
+    async def _call_groq(self, text: str, system_prompt: str) -> str:
+        headers = {
+            "Authorization": f"Bearer {self.groq_api_key}",
+            "Content-Type": "application/json",
+        }
+        # Try llama-3.1-8b-instant which is universally available on all Groq tiers
+        payload = {
+            "model": "llama-3.1-8b-instant",
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": text},
+            ],
+            "temperature": 0.3,
+            "max_tokens": 2048,
+        }
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            res = await client.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=payload)
+            if res.status_code == 200:
+                data = res.json()
+                return data["choices"][0]["message"]["content"]
+            else:
+                raise RuntimeError(f"Groq error HTTP {res.status_code}: {res.text}")
