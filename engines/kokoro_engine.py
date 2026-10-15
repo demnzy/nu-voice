@@ -14,6 +14,7 @@ except ImportError:
     from .base import BaseTTSEngine
 
 logger = logging.getLogger(__name__)
+logging.getLogger("phonemizer").setLevel(logging.ERROR)
 
 
 class KokoroTTSEngine(BaseTTSEngine):

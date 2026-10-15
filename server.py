@@ -30,6 +30,7 @@ from storage.bunny_storage import BunnyAudioStorage
 from engines.engine_manager import EngineManager
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+logging.getLogger("phonemizer").setLevel(logging.ERROR)
 logger = logging.getLogger("nu_voice")
 
 app = FastAPI(
