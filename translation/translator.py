@@ -1,4 +1,4 @@
-﻿"""
+"""
 Educational Translation Engine for Nu-Voice.
 Translates English course material into natural, pedagogical Hausa or French
 using ultra-fast LLM inference (OpenAI by default, with Groq fallback).
@@ -60,7 +60,7 @@ class Translator:
         """
         Translates text to target_lang.
         If target_lang == source_lang, returns text unchanged.
-        Defaults to OpenAI (gpt-4o-mini) as the primary provider.
+        Defaults to OpenAI (gpt-6-luna) as the primary provider.
         """
         target_lang = (target_lang or "en").lower().strip()
         source_lang = (source_lang or "en").lower().strip()
@@ -107,14 +107,19 @@ class Translator:
             "Authorization": f"Bearer {self.openai_api_key}",
             "Content-Type": "application/json",
         }
+        model = getattr(settings, "OPENAI_MODEL", None) or os.getenv("OPENAI_TRANSLATE_MODEL") or os.getenv("OPENAI_MODEL") or "gpt-6-luna"
+        reasoning_effort = getattr(settings, "OPENAI_REASONING_EFFORT", None) or os.getenv("OPENAI_REASONING_EFFORT_TRANSLATE") or "medium"
+        if str(reasoning_effort).strip().lower() in ("none", "minimal", "low"):
+            reasoning_effort = "medium"
+
         payload = {
-            "model": "gpt-4o-mini",
+            "model": str(model).strip(),
             "messages": [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": text},
             ],
-            "temperature": 0.3,
-            "max_tokens": 2048,
+            "reasoning_effort": str(reasoning_effort).strip().lower(),
+            "max_completion_tokens": 2048,
         }
         async with httpx.AsyncClient(timeout=30.0) as client:
             res = await client.post("https://api.openai.com/v1/chat/completions", headers=headers, json=payload)
@@ -137,7 +142,7 @@ class Translator:
                 {"role": "user", "content": text},
             ],
             "temperature": 0.3,
-            "max_tokens": 2048,
+            "max_completion_tokens": 2048,
         }
         async with httpx.AsyncClient(timeout=20.0) as client:
             res = await client.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=payload)

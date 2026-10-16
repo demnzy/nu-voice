@@ -1,4 +1,4 @@
-﻿"""
+"""
 Configuration & Environment Settings for Nu-Voice.
 Loads credentials for Bunny.net CDN, OpenAI/Groq translation, and server options.
 """
@@ -29,6 +29,8 @@ class Settings(BaseSettings):
     # Translation Providers (OpenAI is primary default, Groq fallback)
     DEFAULT_TRANSLATION_PROVIDER: str = "openai"
     OPENAI_API_KEY: str = ""
+    OPENAI_MODEL: str = "gpt-6-luna"
+    OPENAI_REASONING_EFFORT: str = "medium"
     GROQ_API_KEY: str = ""
 
     # Engine Options
