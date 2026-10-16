@@ -1,4 +1,4 @@
-﻿"""
+"""
 Nu-Voice FastAPI Microservice.
 High-throughput, low-latency streaming TTS engine supporting English, French, and Hausa.
 Features decoupled background synthesis, Bunny CDN persistent caching, client disconnect resiliency,
@@ -19,6 +19,7 @@ REPO_ROOT = Path(__file__).resolve().parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, Query, HTTPException, BackgroundTasks, Header, status
 from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -33,10 +34,36 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(na
 logging.getLogger("phonemizer").setLevel(logging.ERROR)
 logger = logging.getLogger("nu_voice")
 
+engine_manager = EngineManager()
+translator = Translator()
+bunny_storage = BunnyAudioStorage()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    if getattr(settings, "PRELOAD_MODELS_ON_STARTUP", True):
+        logger.info("[STARTUP] Scheduling background neural model pre-load & warmup...")
+        raw_langs = getattr(settings, "PRELOAD_LANGUAGES", "en,ha,fr") or "en,ha,fr"
+        target_langs = [l.strip().lower() for l in raw_langs.split(",") if l.strip()]
+        warmup = getattr(settings, "WARMUP_ON_PRELOAD", True)
+
+        def _do_preload():
+            try:
+                engine_manager.preload_all_engines(languages=target_langs, warmup=warmup)
+            except Exception as ex:
+                logger.error(f"[STARTUP] Preload worker error: {ex}")
+
+        asyncio.create_task(asyncio.to_thread(_do_preload))
+
+    yield
+    logger.info("Nu-Voice microservice shutting down.")
+
+
 app = FastAPI(
     title="Nu-Voice TTS Streaming Service",
     version="1.0.0",
     description="Reusable multi-language speech streaming microservice for the Nu-Age ecosystem",
+    lifespan=lifespan,
 )
 
 app.add_middleware(
@@ -46,10 +73,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-engine_manager = EngineManager()
-translator = Translator()
-bunny_storage = BunnyAudioStorage()
 
 AUDIO_CACHE: Dict[str, str] = {}
 _ACTIVE_SYNTHESES: Dict[str, asyncio.Task] = {}
@@ -76,6 +99,7 @@ async def root():
         "version": "1.0.0",
         "cache_entries": len(AUDIO_CACHE),
         "active_syntheses": len(_ACTIVE_SYNTHESES),
+        "models": engine_manager.get_models_status(),
     }
 
 
@@ -346,13 +370,37 @@ async def stream_lesson_audio(
     )
 
 
+@app.get("/v1/models/status")
+async def get_models_status():
+    """Returns detailed thread-safe status of all voice engines and memory residency."""
+    return engine_manager.get_models_status()
+
+
+@app.post("/v1/models/preload")
+async def trigger_models_preload(
+    warmup: bool = Query(True, description="Whether to execute a 1-word warmup synthesis"),
+    langs: Optional[str] = Query(None, description="Comma-separated language codes: en,ha,fr"),
+):
+    """Triggers on-demand neural model preloading and RAM warmup."""
+    target_langs = [l.strip().lower() for l in langs.split(",") if l.strip()] if langs else None
+    report = await asyncio.to_thread(engine_manager.preload_all_engines, languages=target_langs, warmup=warmup)
+    return {
+        "message": "Model preload sequence executed.",
+        "report": report,
+        "models": engine_manager.get_models_status(),
+    }
+
+
 @app.get("/v1/tts/health")
 async def health_check():
+    models_status = engine_manager.get_models_status()
+    loaded_langs = [k for k, v in models_status.items() if isinstance(v, dict) and v.get("loaded")]
     return {
         "status": "healthy",
         "service": "nu-voice",
         "port": settings.PORT,
-        "loaded_engines": list(engine_manager.engines.keys()),
+        "loaded_engines": loaded_langs,
+        "models": models_status,
         "cache_entries": len(AUDIO_CACHE),
         "active_syntheses": len(_ACTIVE_SYNTHESES),
     }

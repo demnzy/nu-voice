@@ -38,6 +38,11 @@ class Settings(BaseSettings):
     DEFAULT_ENGLISH_VOICE: str = "af_heart"
     CPU_THREADS: int = 2
 
+    # Model Preloading & Warmup
+    PRELOAD_MODELS_ON_STARTUP: bool = True
+    PRELOAD_LANGUAGES: str = "en,ha,fr"
+    WARMUP_ON_PRELOAD: bool = True
+
     model_config = SettingsConfigDict(
         env_file=str(ENV_PATH) if ENV_PATH.exists() else None,
         extra="ignore"
